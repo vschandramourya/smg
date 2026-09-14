@@ -172,9 +172,10 @@ pub(crate) fn extract_thinking_from_kwargs(
 /// The thinking preference implied by `reasoning_effort` for a renderer
 /// with native effort values, so the reasoning parser is armed consistently
 /// with the rendered prompt: `Some(true)` for a native value (the renderer
-/// enters thinking mode), `Some(false)` for `"none"` (the renderer's thinking
-/// switch, which turns thinking off and short-circuits the generic
-/// `reasoning_effort` fallback in `resolve_thinking_pref`), `None` otherwise.
+/// enters thinking mode), `Some(false)` for the thinking switch
+/// (`"none"`/`"minimal"`, see [`thinking_from_reasoning_effort`]), which turns
+/// thinking off and short-circuits the generic `reasoning_effort` fallback in
+/// `resolve_thinking_pref`, and `None` otherwise.
 /// Mirrors the template-kwargs merge: an explicit kwargs entry wins over the
 /// top-level `reasoning_effort` field.
 fn extract_template_effort_thinking(
