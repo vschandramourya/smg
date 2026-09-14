@@ -613,17 +613,43 @@ mod tests {
     }
 
     #[test]
-    fn v41_enable_thinking_alone_is_ignored_until_the_gateway_learns_the_alias() {
-        // The gateway reads only the key this tokenizer reports
-        // (`thinking_key_name() == Thinking`), so `enable_thinking: false`
-        // must not switch the prompt to chat mode while the parser stays
-        // armed. vLLM's `enable_thinking` alias is scheduled for the
-        // gateway-side task (Task 17); re-enable it in the shim together with
-        // that change.
+    fn v41_enable_thinking_alias_switches_the_mode_like_thinking() {
+        // vLLM's `enable_thinking` alias is honoured on both sides: the shim
+        // reads it here and the gateway reads it when it arms the parser
+        // (`renderer_capabilities().enable_thinking_alias`).
         let (_tmp, tokenizer) = v41_tokenizer();
         let kw = HashMap::from([("enable_thinking".to_string(), json!(false))]);
         let out = render_v41_turn(&tokenizer, Some(&kw), None).unwrap();
-        assert!(out.ends_with(V41_THINKING_TAIL), "{out}");
+        assert!(out.ends_with("<｜Assistant｜></think>"), "{out}");
+        // Agreeing duplicates are fine ...
+        let kw = HashMap::from([
+            ("enable_thinking".to_string(), json!(false)),
+            ("thinking".to_string(), json!(false)),
+        ]);
+        let out = render_v41_turn(&tokenizer, Some(&kw), None).unwrap();
+        assert!(out.ends_with("<｜Assistant｜></think>"), "{out}");
+        // ... disagreeing ones are a request error naming both keys.
+        let kw = HashMap::from([
+            ("enable_thinking".to_string(), json!(true)),
+            ("thinking".to_string(), json!(false)),
+        ]);
+        let err = render_v41_turn(&tokenizer, Some(&kw), None)
+            .expect_err("disagreeing toggles must error")
+            .to_string();
+        assert!(err.contains("disagree"), "{err}");
+        assert!(
+            err.contains("enable_thinking") && err.contains("thinking"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn v41_reports_its_renderer_capabilities() {
+        let (_tmp, tokenizer) = v41_tokenizer();
+        let caps = tokenizer.renderer_capabilities();
+        assert!(caps.enable_thinking_alias, "{caps:?}");
+        assert!(caps.native_assistant_continuation, "{caps:?}");
+        assert!(caps.raw_tool_call_arguments, "{caps:?}");
     }
 
     #[test]

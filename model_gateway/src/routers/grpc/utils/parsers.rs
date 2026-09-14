@@ -139,7 +139,18 @@ pub(crate) fn extract_thinking_from_kwargs(
         Some(ThinkingKeyName::EnableThinking) => {
             kwargs.get("enable_thinking").and_then(Value::as_bool)
         }
-        Some(ThinkingKeyName::Thinking) => kwargs.get("thinking").and_then(Value::as_bool),
+        // Renderers that honour vLLM's `enable_thinking` alias (DeepSeek-V4.1)
+        // read it too; `thinking` wins when both are present (the renderer
+        // rejects a disagreeing pair before anything is dispatched).
+        Some(ThinkingKeyName::Thinking) => {
+            kwargs.get("thinking").and_then(Value::as_bool).or_else(|| {
+                tokenizer
+                    .renderer_capabilities()
+                    .enable_thinking_alias
+                    .then(|| kwargs.get("enable_thinking").and_then(Value::as_bool))
+                    .flatten()
+            })
+        }
         // Tri-state string toggle: "adaptive" (or any other value) means the
         // template adds no prefix, so it maps to no preference.
         Some(ThinkingKeyName::ThinkingMode) => {
@@ -170,6 +181,12 @@ fn extract_template_effort_thinking(
         .and_then(|k| k.get("reasoning_effort"))
         .and_then(Value::as_str)
         .or(reasoning_effort)?;
+    // `"none"` is the renderer's thinking switch, not an effort level: it
+    // renders chat mode wherever it arrives (kwargs or top-level), so the
+    // parser must be disarmed the same way.
+    if effort == "none" {
+        return Some(false);
+    }
     native_values.contains(&effort).then_some(true)
 }
 
@@ -379,6 +396,121 @@ mod tests {
         fn thinking_key_name(&self) -> Option<ThinkingKeyName> {
             Some(ThinkingKeyName::ThinkingMode)
         }
+    }
+
+    /// A tokenizer shaped like the DeepSeek-V4.1 renderer: `thinking` key,
+    /// native effort names, thinking on by default, and every renderer
+    /// capability declared.
+    struct V41Like(llm_tokenizer::MockTokenizer);
+    impl Encoder for V41Like {
+        fn encode(&self, i: &str, s: bool) -> anyhow::Result<Encoding> {
+            self.0.encode(i, s)
+        }
+        fn encode_batch(&self, i: &[&str], s: bool) -> anyhow::Result<Vec<Encoding>> {
+            self.0.encode_batch(i, s)
+        }
+    }
+    impl llm_tokenizer::traits::Decoder for V41Like {
+        fn decode(&self, ids: &[u32], s: bool) -> anyhow::Result<String> {
+            self.0.decode(ids, s)
+        }
+    }
+    impl Tokenizer for V41Like {
+        fn vocab_size(&self) -> usize {
+            self.0.vocab_size()
+        }
+        fn get_special_tokens(&self) -> &llm_tokenizer::traits::SpecialTokens {
+            self.0.get_special_tokens()
+        }
+        fn token_to_id(&self, t: &str) -> Option<u32> {
+            self.0.token_to_id(t)
+        }
+        fn id_to_token(&self, id: u32) -> Option<String> {
+            self.0.id_to_token(id)
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn thinking_toggle(&self) -> ThinkingToggle {
+            ThinkingToggle::DefaultOn
+        }
+        fn thinking_key_name(&self) -> Option<ThinkingKeyName> {
+            Some(ThinkingKeyName::Thinking)
+        }
+        fn native_reasoning_effort_values(&self) -> &'static [&'static str] {
+            &["low", "high", "xhigh", "max"]
+        }
+        fn renderer_capabilities(&self) -> llm_tokenizer::traits::RendererCapabilities {
+            llm_tokenizer::traits::RendererCapabilities {
+                enable_thinking_alias: true,
+                native_assistant_continuation: true,
+                raw_tool_call_arguments: true,
+            }
+        }
+    }
+
+    /// The gateway arms the reasoning parser exactly the way the V4.1
+    /// renderer picks the mode: `thinking` or its `enable_thinking` alias
+    /// first, then the effective `reasoning_effort` (`"none"` off, a native
+    /// name on), then the OpenAI mapping of the top-level field.
+    #[test]
+    fn v41_alias_and_kwargs_none_arm_like_the_renderer() {
+        let tok = V41Like(llm_tokenizer::MockTokenizer::new());
+        let alias_off =
+            std::collections::HashMap::from([("enable_thinking".to_string(), Value::Bool(false))]);
+        assert_eq!(
+            extract_thinking_from_kwargs(Some(&alias_off), &tok),
+            Some(false)
+        );
+        assert_eq!(
+            resolve_user_thinking(Some(&alias_off), Some("high"), &tok),
+            Some(false)
+        );
+        // `thinking` wins when both keys are present.
+        let both = std::collections::HashMap::from([
+            ("thinking".to_string(), Value::Bool(true)),
+            ("enable_thinking".to_string(), Value::Bool(false)),
+        ]);
+        assert_eq!(extract_thinking_from_kwargs(Some(&both), &tok), Some(true));
+        // Tokenizers that do not declare the alias keep reading their own key only.
+        let other = T(llm_tokenizer::MockTokenizer::new());
+        assert_eq!(extract_thinking_from_kwargs(Some(&alias_off), &other), None);
+
+        // A kwargs `"none"` disarms even when the top-level field is a native level.
+        let none_kw = std::collections::HashMap::from([(
+            "reasoning_effort".to_string(),
+            Value::String("none".to_string()),
+        )]);
+        assert_eq!(
+            extract_template_effort_thinking(Some(&none_kw), Some("high"), &tok),
+            Some(false)
+        );
+        assert_eq!(
+            resolve_user_thinking(Some(&none_kw), Some("high"), &tok),
+            Some(false)
+        );
+        // Native names arm; a top-level "none" disarms; an explicit toggle beats "none".
+        assert_eq!(resolve_user_thinking(None, Some("xhigh"), &tok), Some(true));
+        assert_eq!(resolve_user_thinking(None, Some("none"), &tok), Some(false));
+        let explicit_on = std::collections::HashMap::from([
+            ("thinking".to_string(), Value::Bool(true)),
+            (
+                "reasoning_effort".to_string(),
+                Value::String("none".to_string()),
+            ),
+        ]);
+        assert_eq!(
+            resolve_user_thinking(Some(&explicit_on), None, &tok),
+            Some(true)
+        );
+        assert!(should_mark_reasoning_started(
+            resolve_user_thinking(Some(&explicit_on), None, &tok),
+            &tok
+        ));
+        assert!(!should_mark_reasoning_started(
+            resolve_user_thinking(Some(&none_kw), Some("high"), &tok),
+            &tok
+        ));
     }
 
     #[test]

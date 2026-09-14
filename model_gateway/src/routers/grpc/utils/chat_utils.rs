@@ -552,8 +552,13 @@ pub(crate) fn process_chat_messages_with_placeholders(
             media_order,
         )?;
 
-        // Process tool call arguments in assistant messages
-        process_tool_call_arguments(&mut transformed_messages)?;
+        // Process tool call arguments in assistant messages. Renderers that
+        // parse `arguments` strings themselves with the reference's tolerance
+        // (DeepSeek-V4.1) get them as written; every other template gets the
+        // parsed object the Transformers docs expect.
+        if !tokenizer.renderer_capabilities().raw_tool_call_arguments {
+            process_tool_call_arguments(&mut transformed_messages)?;
+        }
 
         // Convert tools to JSON values for template processing
         let tools_json: Option<Vec<Value>> = request
@@ -576,8 +581,24 @@ pub(crate) fn process_chat_messages_with_placeholders(
             Some(&combined_template_kwargs)
         };
 
+        let continues_final_assistant = request.continue_final_message
+            && transformed_messages
+                .last()
+                .and_then(|msg| msg.get("role"))
+                .and_then(|v| v.as_str())
+                == Some("assistant");
+        // Renderers that continue a trailing assistant message natively
+        // (DeepSeek-V4.1: rendered without EOS and without a generation
+        // header) keep the message and are called without a generation
+        // prompt; other templates get the message popped and its content
+        // appended after the generation prompt as a prefix.
+        let native_continuation = continues_final_assistant
+            && tokenizer
+                .renderer_capabilities()
+                .native_assistant_continuation;
+
         let params = ChatTemplateParams {
-            add_generation_prompt: true,
+            add_generation_prompt: !native_continuation,
             tools: tools_json.as_deref(),
             template_kwargs: final_template_kwargs,
             // Project OpenAI `reasoning_effort` (none/minimal) onto the model's
@@ -590,14 +611,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
         };
 
         // Handle assistant prefix for continue_final_message
-        let assistant_prefix = if request.continue_final_message
-            && !transformed_messages.is_empty()
-            && transformed_messages
-                .last()
-                .and_then(|msg| msg.get("role"))
-                .and_then(|v| v.as_str())
-                == Some("assistant")
-        {
+        let assistant_prefix = if continues_final_assistant && !native_continuation {
             // Pop the last message to handle it separately — guarded by !is_empty() check above
             let Some(last_msg) = transformed_messages.pop() else {
                 return Ok((

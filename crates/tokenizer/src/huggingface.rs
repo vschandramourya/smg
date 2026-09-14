@@ -598,9 +598,8 @@ impl TokenizerTrait for HuggingFaceTokenizer {
             // the native encoder so we must report it directly.
             Renderer::DeepseekV32 | Renderer::DeepseekV4(_) => ThinkingToggle::DefaultOff,
             // V4.1 defaults thinking ON: `reasoning_effort: "none"` or an
-            // explicit `thinking: false` turns it off. vLLM's `enable_thinking`
-            // alias is deliberately ignored by the shim until the gateway
-            // learns it (see `explicit_thinking_v41`).
+            // explicit `thinking: false` (or vLLM's `enable_thinking` alias,
+            // see `renderer_capabilities`) turns it off.
             Renderer::DeepseekV41 => ThinkingToggle::DefaultOn,
             Renderer::Jinja => self.chat_template.thinking_toggle(),
         }
@@ -629,6 +628,23 @@ impl TokenizerTrait for HuggingFaceTokenizer {
             // starts mid-reasoning and the parser must be told so.
             Renderer::DeepseekV32 | Renderer::DeepseekV4(_) | Renderer::DeepseekV41 => true,
             Renderer::Jinja => self.chat_template.think_in_prefill(),
+        }
+    }
+
+    fn renderer_capabilities(&self) -> crate::traits::RendererCapabilities {
+        match self.renderer {
+            // The V4.1 shim honours vLLM's `enable_thinking` alias, renders a
+            // trailing assistant message itself when `add_generation_prompt`
+            // is false, and parses tool-call `arguments` strings with the
+            // reference's tolerance.
+            Renderer::DeepseekV41 => crate::traits::RendererCapabilities {
+                enable_thinking_alias: true,
+                native_assistant_continuation: true,
+                raw_tool_call_arguments: true,
+            },
+            Renderer::DeepseekV32 | Renderer::DeepseekV4(_) | Renderer::Jinja => {
+                crate::traits::RendererCapabilities::default()
+            }
         }
     }
 
@@ -856,17 +872,23 @@ fn boolean_kwarg_v41(params: &ChatTemplateParams, key: &str) -> Result<Option<bo
     }
 }
 
-/// V4.1's explicit thinking toggle: `template_kwargs["thinking"]`, the key
-/// this tokenizer reports through `thinking_key_name()` and therefore the only
-/// key the gateway consults when it arms the reasoning parser. Read with the
-/// strict [`boolean_kwarg_v41`] rule.
-///
-/// vLLM's `enable_thinking` alias is deliberately NOT read here: the gateway
-/// does not know the alias yet, so honouring it would render chat mode while
-/// the parser stays armed. Re-enable it together with the gateway-side change
-/// (Task 17) so both sides learn the alias at once.
+/// V4.1's explicit thinking toggle: `template_kwargs["thinking"]` (the key
+/// this tokenizer reports through `thinking_key_name()`) or vLLM's
+/// `enable_thinking` alias, both read with the strict [`boolean_kwarg_v41`]
+/// rule. The gateway reads the same two keys when it arms the reasoning
+/// parser (`renderer_capabilities().enable_thinking_alias`), so the prompt
+/// and the parser never disagree; both present and different is an error.
 fn explicit_thinking_v41(params: &ChatTemplateParams) -> Result<Option<bool>> {
-    boolean_kwarg_v41(params, "thinking")
+    let thinking = boolean_kwarg_v41(params, "thinking")?;
+    let alias = boolean_kwarg_v41(params, "enable_thinking")?;
+    match (thinking, alias) {
+        (Some(a), Some(b)) if a != b => Err(Error::msg(format!(
+            "DeepSeek V4.1: template_kwargs[\"thinking\"] = {a} and \
+             template_kwargs[\"enable_thinking\"] = {b} disagree"
+        ))),
+        (Some(value), _) | (None, Some(value)) => Ok(Some(value)),
+        (None, None) => Ok(None),
+    }
 }
 
 /// The gateway deserialises a top-level JSON number (`"reasoning_effort": 42`)
