@@ -1755,6 +1755,164 @@ mod tests {
         );
     }
 
+    // --- renderer-capability gates on the render path ------------------------
+
+    /// A `MockTokenizer` that declares renderer capabilities and renders the
+    /// message list itself, so both gates are observable without a checkpoint:
+    /// which messages reach the template, whether a generation prompt was
+    /// asked for, and whether tool-call `arguments` arrive as written.
+    struct CapabilityTokenizer(
+        llm_tokenizer::MockTokenizer,
+        llm_tokenizer::traits::RendererCapabilities,
+    );
+
+    impl CapabilityTokenizer {
+        fn new(capabilities: llm_tokenizer::traits::RendererCapabilities) -> Self {
+            Self(llm_tokenizer::MockTokenizer::new(), capabilities)
+        }
+    }
+
+    impl llm_tokenizer::traits::Encoder for CapabilityTokenizer {
+        fn encode(&self, input: &str, special: bool) -> anyhow::Result<Encoding> {
+            self.0.encode(input, special)
+        }
+        fn encode_batch(&self, inputs: &[&str], special: bool) -> anyhow::Result<Vec<Encoding>> {
+            self.0.encode_batch(inputs, special)
+        }
+    }
+
+    impl llm_tokenizer::traits::Decoder for CapabilityTokenizer {
+        fn decode(&self, ids: &[u32], special: bool) -> anyhow::Result<String> {
+            self.0.decode(ids, special)
+        }
+    }
+
+    impl Tokenizer for CapabilityTokenizer {
+        fn vocab_size(&self) -> usize {
+            self.0.vocab_size()
+        }
+        fn get_special_tokens(&self) -> &llm_tokenizer::traits::SpecialTokens {
+            self.0.get_special_tokens()
+        }
+        fn token_to_id(&self, token: &str) -> Option<u32> {
+            self.0.token_to_id(token)
+        }
+        fn id_to_token(&self, id: u32) -> Option<String> {
+            self.0.id_to_token(id)
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn renderer_capabilities(&self) -> llm_tokenizer::traits::RendererCapabilities {
+            self.1
+        }
+        fn apply_chat_template(
+            &self,
+            messages: &[Value],
+            params: ChatTemplateParams,
+        ) -> anyhow::Result<String> {
+            Ok(json!({
+                "messages": messages,
+                "add_generation_prompt": params.add_generation_prompt,
+            })
+            .to_string())
+        }
+    }
+
+    fn render_with(
+        capabilities: llm_tokenizer::traits::RendererCapabilities,
+        request: &ChatCompletionRequest,
+    ) -> Value {
+        let tokenizer = CapabilityTokenizer::new(capabilities);
+        let (processed, _) = process_chat_messages_with_placeholders(
+            request,
+            &tokenizer,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap();
+        // The default `apply_chat_template_with_encoding` appends the
+        // assistant prefix after the rendered text, so a prefill that was
+        // popped shows up as a suffix on the JSON document.
+        let split = processed.text.rfind('}').unwrap() + 1;
+        let (rendered, suffix) = processed.text.split_at(split);
+        let mut value: Value = serde_json::from_str(rendered).unwrap();
+        value["assistant_prefix"] = json!(suffix);
+        value
+    }
+
+    const NATIVE_CONTINUATION: llm_tokenizer::traits::RendererCapabilities =
+        llm_tokenizer::traits::RendererCapabilities {
+            enable_thinking_alias: false,
+            native_assistant_continuation: true,
+            raw_tool_call_arguments: false,
+        };
+    const RAW_ARGUMENTS: llm_tokenizer::traits::RendererCapabilities =
+        llm_tokenizer::traits::RendererCapabilities {
+            enable_thinking_alias: false,
+            native_assistant_continuation: false,
+            raw_tool_call_arguments: true,
+        };
+
+    /// Without the capability the trailing assistant message is popped and its
+    /// content is appended after a generation prompt; with it the message
+    /// stays in the list and no generation prompt is requested (the renderer
+    /// continues the turn itself).
+    #[test]
+    fn native_continuation_keeps_the_trailing_assistant_message_instead_of_prefixing_it() {
+        let request = prefill_request();
+
+        let default = render_with(Default::default(), &request);
+        assert_eq!(default["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(default["messages"][0]["role"], "user");
+        assert_eq!(default["add_generation_prompt"], json!(true));
+        assert_eq!(default["assistant_prefix"], json!("Sure"));
+
+        let native = render_with(NATIVE_CONTINUATION, &request);
+        assert_eq!(native["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(native["messages"][1]["role"], "assistant");
+        assert_eq!(native["messages"][1]["content"], "Sure");
+        assert_eq!(native["add_generation_prompt"], json!(false));
+        assert_eq!(native["assistant_prefix"], json!(""));
+    }
+
+    /// Without the capability a tool call's `arguments` string is parsed into
+    /// an object before rendering (what Transformers templates expect); with
+    /// it the string reaches the renderer as written, so a native renderer can
+    /// apply the reference's own tolerance.
+    #[test]
+    fn raw_tool_call_arguments_reach_the_renderer_as_written() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{\"city\": \"Hangzhou\"}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "ok"}
+            ]
+        }))
+        .unwrap();
+
+        let parsed = render_with(Default::default(), &request);
+        assert_eq!(
+            parsed["messages"][1]["tool_calls"][0]["function"]["arguments"],
+            json!({"city": "Hangzhou"})
+        );
+
+        let raw = render_with(RAW_ARGUMENTS, &request);
+        assert_eq!(
+            raw["messages"][1]["tool_calls"][0]["function"]["arguments"],
+            json!("{\"city\": \"Hangzhou\"}")
+        );
+    }
+
     #[test]
     fn deferred_renderer_gets_the_prefill_and_its_job_runs_in_the_tokenize_step() {
         let tokenizer = llm_tokenizer::MockTokenizer::new().with_deferred_chat_ids(vec![7, 8, 9]);
