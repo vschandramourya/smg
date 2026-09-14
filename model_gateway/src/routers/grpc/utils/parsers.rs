@@ -190,10 +190,10 @@ fn extract_template_effort_thinking(
         .and_then(|k| k.get("reasoning_effort"))
         .and_then(Value::as_str)
         .or(reasoning_effort)?;
-    // `"none"` is the renderer's thinking switch, not an effort level: it
-    // renders chat mode wherever it arrives (kwargs or top-level), so the
-    // parser must be disarmed the same way.
-    if effort == "none" {
+    // `"none"`/`"minimal"` are the renderer's thinking switch, not effort
+    // levels: they render chat mode wherever they arrive (kwargs or
+    // top-level), so the parser must be disarmed the same way.
+    if thinking_from_reasoning_effort(Some(effort)) == Some(false) {
         return Some(false);
     }
     native_values.contains(&effort).then_some(true)
@@ -434,6 +434,15 @@ mod tests {
             Some(false)
         );
         assert_eq!(resolve_user_thinking(None, Some("none"), &tok), Some(false));
+        // `minimal` is the switch's other spelling and disarms the same way.
+        let minimal_kw = std::collections::HashMap::from([(
+            "reasoning_effort".to_string(),
+            Value::String("minimal".to_string()),
+        )]);
+        assert_eq!(
+            extract_template_effort_thinking(Some(&minimal_kw), Some("high"), &tok),
+            Some(false)
+        );
     }
 
     use llm_tokenizer::traits::{Encoder, Encoding};

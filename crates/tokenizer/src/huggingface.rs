@@ -930,9 +930,10 @@ fn restore_integer_reasoning_effort(value: &serde_json::Value) -> Option<serde_j
 /// so the rendered prompt and the arming decision agree on every request
 /// shape:
 /// 1. an explicit `template_kwargs["thinking"]` boolean decides;
-/// 2. else the `reasoning_effort` kwarg: `"none"` switches thinking off, a
-///    native effort name (`low`/`high`/`xhigh`/`max`) switches it on, and an
-///    integer budget has no opinion;
+/// 2. else the `reasoning_effort` kwarg: `"none"`/`"minimal"` (the gateway's
+///    thinking switch, `thinking_from_reasoning_effort`) switch thinking off,
+///    a native effort name (`low`/`high`/`xhigh`/`max`) switches it on, and
+///    an integer budget has no opinion;
 /// 3. else `params.thinking` (the gateway's projection of the top-level
 ///    `reasoning_effort`: `Some(false)` for `none`/`minimal`);
 /// 4. else on ([`ThinkingToggle::DefaultOn`]).
@@ -941,9 +942,10 @@ fn restore_integer_reasoning_effort(value: &serde_json::Value) -> Option<serde_j
 /// forces chat mode even over an explicit `thinking: true`. Here the explicit
 /// toggle wins, because the gateway arms the reasoning parser from the
 /// explicit toggle first, and rendering chat mode for that contradictory input
-/// would have the armed parser swallow the whole answer as reasoning. `"none"`
-/// still never reaches `parse_reasoning_effort` (which rejects it) and leaves
-/// the effort unset, so a thinking-mode prompt carries the default budget.
+/// would have the armed parser swallow the whole answer as reasoning. Neither
+/// switch value reaches `parse_reasoning_effort` (which rejects both, as the
+/// reference does) and both leave the effort unset, so a thinking-mode prompt
+/// carries the default budget.
 fn apply_deepseek_v41(
     messages: &[serde_json::Value],
     params: &ChatTemplateParams,
@@ -960,8 +962,9 @@ fn apply_deepseek_v41(
         .template_kwargs
         .and_then(|k| k.get("reasoning_effort"));
     let effort_name = effort_kwarg.and_then(serde_json::Value::as_str);
-    // `"none"` is a thinking switch, not an effort level.
-    let effort_is_none = effort_name == Some("none");
+    // `"none"`/`"minimal"` are the gateway's thinking switch (both project to
+    // thinking off everywhere else in SMG), not effort levels.
+    let effort_is_none = matches!(effort_name, Some("none") | Some("minimal"));
     let reasoning_effort = if effort_is_none {
         None
     } else {

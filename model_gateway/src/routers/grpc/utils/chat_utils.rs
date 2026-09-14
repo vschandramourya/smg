@@ -613,7 +613,9 @@ pub(crate) fn process_chat_messages_with_placeholders(
 
         // Handle assistant prefix for continue_final_message
         let assistant_prefix = if continues_final_assistant && !native_continuation {
-            // Pop the last message to handle it separately — guarded by !is_empty() check above
+            // Pop the last message to render it as the prefix. A trailing
+            // assistant role implies a non-empty list, so the `else` arm is
+            // only defensive.
             let Some(last_msg) = transformed_messages.pop() else {
                 return Ok((
                     ProcessedMessages {
