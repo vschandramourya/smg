@@ -5,6 +5,7 @@ Run with: pytest grpc_servicer/tests/test_vllm_mm_keys.py
 
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 from smg_grpc_proto import vllm_engine_pb2
 
@@ -34,9 +35,18 @@ def test_encoder_input_key_renames_the_primary_tensor():
     )
     mm.flat_keys["patches"] = "patches_per_image"
     assert mm_keys.primary_encoder_key(mm) == "patches"
+    # The router names the flat layout by the same key it names the tensor.
+    assert mm.flat_keys[mm_keys.primary_encoder_key(mm)] == "patches_per_image"
     assert mm_keys.modality_key("patches", is_video=False) == "patches"
     # A renamed primary tensor is never the video pixel key.
     assert mm_keys.modality_key("patches", is_video=True) == "patches"
+
+
+def test_primary_key_tolerates_an_older_proto_stub():
+    # A `smg-grpc-proto` stub built before `encoder_input_key` (field 11) has
+    # no such attribute; the servicer must fall back to the default, not raise.
+    stub = SimpleNamespace(pixel_values=vllm_engine_pb2.TensorData(dtype="float32"))
+    assert mm_keys.primary_encoder_key(stub) == "pixel_values"
 
 
 def test_other_keys_pass_through_unchanged():

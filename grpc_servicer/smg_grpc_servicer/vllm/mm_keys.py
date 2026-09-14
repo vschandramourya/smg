@@ -14,8 +14,13 @@ DEFAULT_ENCODER_INPUT_KEY = "pixel_values"
 
 
 def primary_encoder_key(mm_proto) -> str:
-    """The HF kwarg name for the tensor carried in ``mm_proto.pixel_values``."""
-    return mm_proto.encoder_input_key or DEFAULT_ENCODER_INPUT_KEY
+    """The HF kwarg name for the tensor carried in ``mm_proto.pixel_values``.
+
+    ``encoder_input_key`` is proto field 11; a ``smg-grpc-proto`` stub built
+    from an older proto (releases up to 0.4.18) has no such attribute, and
+    that must read as the default rather than break every multimodal request.
+    """
+    return getattr(mm_proto, "encoder_input_key", "") or DEFAULT_ENCODER_INPUT_KEY
 
 
 def modality_key(key: str, is_video: bool) -> str:

@@ -914,10 +914,11 @@ fn restore_integer_reasoning_effort(value: &serde_json::Value) -> Option<serde_j
 /// message when `add_generation_prompt` is false -> encode.
 ///
 /// `add_generation_prompt: false` with a trailing assistant message is the
-/// encoder's `wo_eos` route (no EOS, no generation header). The gateway does
-/// not send it yet: it renders `continue_final_message` by popping the
-/// trailing assistant message and appending its content after the generation
-/// header; routing that through this shim is a follow-up.
+/// encoder's `wo_eos` route (no EOS, no generation header). The gateway sends
+/// it for `continue_final_message` with a trailing assistant turn because
+/// `renderer_capabilities().native_assistant_continuation` is declared, and
+/// does not arm the reasoning parser for that shape: the message is rendered
+/// past its `</think>`, so the completion starts in content mode.
 ///
 /// The shim reads the merged template kwargs, so an explicit
 /// `chat_template_kwargs.reasoning_effort` wins over the projected top-level

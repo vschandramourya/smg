@@ -6,7 +6,10 @@ use llm_tokenizer::{
     chat_template::{ThinkingKeyName, ThinkingToggle},
     traits::Tokenizer,
 };
-use openai_protocol::{chat::thinking_from_reasoning_effort, model_card::ModelCard};
+use openai_protocol::{
+    chat::{thinking_from_reasoning_effort, ChatCompletionRequest, ChatMessage},
+    model_card::ModelCard,
+};
 use reasoning_parser::{ParserFactory as ReasoningParserFactory, ReasoningParser};
 use serde_json::Value;
 use tool_parser::{
@@ -128,8 +131,10 @@ pub fn should_mark_reasoning_started(
 /// Extract the user's thinking preference from chat_template_kwargs.
 ///
 /// Only checks the key that the template actually uses (e.g. `enable_thinking`
-/// for Qwen3, `thinking` for Kimi-K2.5). This prevents mismatches where the
-/// user passes the wrong key name and the template ignores it.
+/// for Qwen3, `thinking` for Kimi-K2.5), plus vLLM's `enable_thinking` alias
+/// for renderers that declare it (`RendererCapabilities::enable_thinking_alias`).
+/// This prevents mismatches where the user passes a key name the template
+/// ignores.
 pub(crate) fn extract_thinking_from_kwargs(
     kwargs: Option<&std::collections::HashMap<String, Value>>,
     tokenizer: &dyn Tokenizer,
@@ -202,6 +207,53 @@ fn resolve_thinking_pref(
     explicit
         .or(template_effort)
         .or_else(|| thinking_from_reasoning_effort(reasoning_effort))
+}
+
+/// Whether the reasoning parser must start in reasoning mode, i.e. whether
+/// the rendered prompt ends inside `<think>`.
+///
+/// The effective thinking preference decides, with one exception: a renderer
+/// that continues a trailing assistant message natively
+/// (`continue_final_message`, see `RendererCapabilities`) renders that
+/// message past its `</think>`, so the completion starts in content mode and
+/// the parser must not be armed.
+pub fn reasoning_starts_in_prefill(
+    kwargs: Option<&std::collections::HashMap<String, Value>>,
+    reasoning_effort: Option<&str>,
+    continues_final_assistant: bool,
+    tokenizer: &dyn Tokenizer,
+) -> bool {
+    if continues_final_assistant
+        && tokenizer
+            .renderer_capabilities()
+            .native_assistant_continuation
+    {
+        return false;
+    }
+    should_mark_reasoning_started(
+        resolve_user_thinking(kwargs, reasoning_effort, tokenizer),
+        tokenizer,
+    )
+}
+
+/// Whether `continue_final_message` applies to the request: it asks to
+/// continue the trailing assistant message, and the request ends with one.
+pub fn continues_final_assistant(request: &ChatCompletionRequest) -> bool {
+    request.continue_final_message
+        && matches!(request.messages.last(), Some(ChatMessage::Assistant { .. }))
+}
+
+/// [`reasoning_starts_in_prefill`] for a chat request.
+pub fn chat_reasoning_starts_in_prefill(
+    request: &ChatCompletionRequest,
+    tokenizer: &dyn Tokenizer,
+) -> bool {
+    reasoning_starts_in_prefill(
+        request.chat_template_kwargs.as_ref(),
+        request.reasoning_effort.as_deref(),
+        continues_final_assistant(request),
+        tokenizer,
+    )
 }
 
 /// Resolve the user's effective thinking preference.
@@ -526,6 +578,33 @@ mod tests {
         );
         assert!(should_mark_reasoning_started(
             resolve_user_thinking(Some(&explicit_on), None, &tok),
+            &tok
+        ));
+
+        // A native continuation renders the trailing assistant message past
+        // its `</think>`, so the parser is not armed for that request even
+        // though thinking is on; any other trailing role arms as usual.
+        let request = |continue_final: bool, last_role: &str| -> ChatCompletionRequest {
+            serde_json::from_value(serde_json::json!({
+                "model": "m",
+                "messages": [
+                    {"role": "user", "content": "q"},
+                    {"role": last_role, "content": "a"}
+                ],
+                "continue_final_message": continue_final,
+            }))
+            .expect("chat request")
+        };
+        assert!(chat_reasoning_starts_in_prefill(
+            &request(false, "assistant"),
+            &tok
+        ));
+        assert!(!chat_reasoning_starts_in_prefill(
+            &request(true, "assistant"),
+            &tok
+        ));
+        assert!(chat_reasoning_starts_in_prefill(
+            &request(true, "user"),
             &tok
         ));
         assert!(!should_mark_reasoning_started(
