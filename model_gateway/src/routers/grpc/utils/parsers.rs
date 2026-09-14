@@ -359,6 +359,27 @@ mod tests {
         assert_eq!(resolve_thinking_pref(None, None, None), None);
     }
 
+    /// A kwargs `reasoning_effort` of `"none"` renders chat mode for native
+    /// renderers, so it must disarm the parser too — even when the top-level
+    /// field names a native level (the kwargs entry wins in the merge).
+    #[test]
+    fn kwargs_none_disarms_like_the_renderer() {
+        let tok = T(llm_tokenizer::MockTokenizer::new());
+        let none_kw = std::collections::HashMap::from([(
+            "reasoning_effort".to_string(),
+            Value::String("none".to_string()),
+        )]);
+        assert_eq!(
+            extract_template_effort_thinking(Some(&none_kw), Some("high"), &tok),
+            Some(false)
+        );
+        assert_eq!(
+            resolve_user_thinking(Some(&none_kw), Some("high"), &tok),
+            Some(false)
+        );
+        assert_eq!(resolve_user_thinking(None, Some("none"), &tok), Some(false));
+    }
+
     use llm_tokenizer::traits::{Encoder, Encoding};
     struct T(llm_tokenizer::MockTokenizer);
     impl Encoder for T {
